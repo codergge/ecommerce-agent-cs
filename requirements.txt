@@ -1,0 +1,30 @@
+# Web 框架
+streamlit>=1.36.0
+
+# LangChain 生态
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+langchain-text-splitters>=0.3.0
+langgraph>=0.3.0
+
+# 记忆持久化（独立分包，必须单独安装，不装会报 No module named 'langgraph.checkpoint.sqlite'）
+langgraph-checkpoint>=2.0.0
+langgraph-checkpoint-sqlite>=2.0.0
+
+# Ollama 本地模型
+langchain-ollama>=0.2.0
+
+# OpenAI 兼容接口
+langchain-openai>=0.2.0
+
+# 向量库
+chromadb>=0.5.0
+langchain-chroma>=0.1.4
+
+# 文档加载
+pypdf>=4.0.0
+docx2txt>=0.8
+
+# 工具
+python-dotenv>=1.0.0
