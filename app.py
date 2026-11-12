@@ -7,7 +7,10 @@ import streamlit as st
 
 from agent.react_agent import CustomerServiceAgent
 from agent.memory import new_thread_id
+from agent.tools import query_order
 from core.llm import get_llm_name
+from core.think_filter import strip_think
+from db.business_repo import get_stats
 from rag.retriever import retrieve_with_meta
 
 # ============ 页面配置 ============
@@ -37,6 +40,20 @@ with st.sidebar:
         st.session_state.agent = CustomerServiceAgent(thread_id=st.session_state.thread_id)
         st.session_state.messages = []
         st.rerun()
+
+    st.divider()
+    st.subheader("🗄 业务数据（SQLite）")
+    try:
+        stats = get_stats()
+        st.caption(
+            f"订单 {stats['orders']} 条 ｜ 物流 {stats['shipments']} 条 ｜ 库存 {stats['inventory']} 条"
+        )
+    except Exception as e:
+        st.caption(f"业务库未就绪：{e}")
+
+    demo_order = st.text_input("订单号快速查询", value="SO20261101001")
+    if st.button("查询订单详情", use_container_width=True):
+        st.code(query_order.invoke({"order_id": demo_order}), language="text")
 
     st.divider()
     st.subheader("🔍 知识库检索测试")
@@ -90,6 +107,9 @@ if user_input:
         try:
             # 用官方 st.write_stream 做增量追加，避免每 token 重绘整块 markdown
             # 导致前端 React 反复卸载/挂载 DOM 节点（典型报错：removeChild ... not a child of this node）
+            holder = {}
+            stream_box = st.empty()   # 占位：流式期间在这里打字，结束后整块替换
+
             def _stream():
                 for event_type, payload in st.session_state.agent.chat_stream(user_input):
                     if event_type == "tool_event":
@@ -98,9 +118,17 @@ if user_input:
                     elif event_type == "token":
                         yield payload
                     elif event_type == "done":
-                        pass
+                        # done 里是已剔除思考块的完整文本，用于覆盖渲染与写入历史
+                        holder["text"] = payload
 
-            full_answer = st.write_stream(_stream()) or ""
+            streamed = stream_box.write_stream(_stream()) or ""
+
+            # 关键一步：流结束时做一次整块覆盖
+            # - 流式过程中显示过的 Qwen3 思考内容会被清除
+            # - 页面最终只保留 done 事件给出的最终回答
+            # 这里是单次替换（不是每 token 重绘），不会触发前端 removeChild 报错
+            full_answer = holder.get("text") or strip_think(streamed)
+            stream_box.markdown(full_answer or "（本次没有生成内容）")
         except Exception as e:
             # 打印完整堆栈到终端，便于定位是 Chroma 还是 SQLite 记忆的连接问题
             import traceback

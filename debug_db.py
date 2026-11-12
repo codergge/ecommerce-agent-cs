@@ -48,8 +48,24 @@ except Exception:
     print("    ❌ checkpointer 失败，堆栈如下：")
     traceback.print_exc()
 
-# ---------- 4. 真正跑一轮 Agent（最容易复现的场景） ----------
-print("\n[4] 走一轮完整 Agent 对话")
+# ---------- 4. 业务数据库（订单/物流/库存） ----------
+print("\n[4] 业务数据库三表 JOIN 与连接单例")
+try:
+    from db.connection import get_business_conn
+    from db.business_repo import get_order_detail, get_stats
+
+    c1 = get_business_conn()
+    c2 = get_business_conn()
+    print("    两次是否同一连接:", c1 is c2)
+    print("    三表行数:", get_stats())
+    o = get_order_detail("SO20261101001")
+    print(f"    订单 JOIN: {o['order_no']} / {o['status']} / {o['carrier']} / 库存 {o['stock']}")
+except Exception:
+    print("    ❌ 业务数据库失败，堆栈如下：")
+    traceback.print_exc()
+
+# ---------- 5. 真正跑一轮 Agent（最容易复现的场景） ----------
+print("\n[5] 走一轮完整 Agent 对话")
 try:
     from agent.react_agent import CustomerServiceAgent
     a = CustomerServiceAgent(thread_id="debug-run")

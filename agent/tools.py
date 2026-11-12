@@ -1,42 +1,31 @@
 """
 Agent 可调用的工具集：
-- search_knowledge_base : RAG 知识库检索（退换货政策、运费规则等）
-- query_order           : 查询订单状态（这里用模拟数据，实际可替换为真实订单 API）
-- query_logistics       : 查询物流轨迹
-- apply_refund          : 提交退款申请
-- check_product_stock  : 查询商品库存
-"""
-from typing import Optional
 
+- search_knowledge_base : RAG 知识库检索（退换货政策、运费规则、会员权益等静态规则）
+- query_order           : 查询订单状态（SQLite orders 表）
+- query_logistics       : 查询物流轨迹（SQLite shipments 表，支持传物流单号或订单号）
+- apply_refund          : 提交退款申请（真实 UPDATE orders 表，非纯文本返回）
+- check_product_stock   : 查询商品库存（SQLite inventory 表，按名称/SKU 模糊检索）
+
+数据源说明：
+    订单 / 物流 / 库存来自本地 SQLite 数据库 data/ecommerce.db，
+    schema 见 data/schema.sql，造数脚本见 db/seed_mock_data.py。
+    三表通过 order_no / tracking_no / sku 三个关键字关联。
+
+为什么工具要从数据库而不是字典取数：
+    字典是硬编码的，改一条数据要改代码；换成 SQLite 后，
+    数据与代码解耦，且能演示参数化查询、多表 JOIN、写操作事务等真实数据访问路径。
+"""
 from langchain_core.tools import tool
 
+from db.business_repo import (
+    get_order_detail,
+    get_shipment,
+    get_shipment_by_order,
+    search_inventory,
+    submit_refund,
+)
 from rag.vector_store import similarity_search
-
-
-# ==================== 模拟业务数据库（实际项目替换为真实 API / DB） ====================
-_MOCK_ORDERS = {
-    "SO20261101001": {"status": "已发货", "amount": 299.00, "product": "降噪耳机 Pro", "logistics_no": "SF1234567890"},
-    "SO20261101002": {"status": "待收货", "amount": 1299.00, "product": "智能手表 S2", "logistics_no": "SF0987654321"},
-    "SO20261101003": {"status": "已完成", "amount": 89.90, "product": "手机壳", "logistics_no": "YT5555666677"},
-}
-
-_MOCK_LOGISTICS = {
-    "SF1234567890": [
-        "2026-11-08 10:20  已从深圳转运中心发出",
-        "2026-11-09 22:10  已到达长沙雨花区派送点",
-        "2026-11-10 08:30  快递员正在派送中，请保持电话畅通",
-    ],
-    "SF0987654321": [
-        "2026-11-09 14:00  已从杭州仓发出",
-        "2026-11-10 06:50  已到达长沙转运中心",
-    ],
-}
-
-_MOCK_STOCK = {
-    "降噪耳机 Pro": {"color": "星空黑", "stock": 23, "price": 299.00},
-    "智能手表 S2": {"color": "钛银", "stock": 0, "price": 1299.00, "note": "预计11月15日到货"},
-    "手机壳": {"color": "透明", "stock": 356, "price": 89.90},
-}
 
 
 # ==================== 工具定义 ====================
@@ -65,68 +54,166 @@ def search_knowledge_base(query: str) -> str:
 @tool
 def query_order(order_id: str) -> str:
     """
-    根据订单号查询订单状态、金额、商品等信息。用户提到订单、买了什么、发货没、
-    订单状态时调用。订单号通常以 SO 开头。
+    根据订单号查询订单状态、商品、金额、收货信息，并返回关联的物流单号与承运商。
+    用户提到订单、买了什么、发货没、订单状态、订单金额时调用。订单号通常以 SO 开头。
 
     Args:
         order_id: 订单号，例如 SO20261101001
     """
-    order = _MOCK_ORDERS.get(order_id)
+    order_id = (order_id or "").strip().upper()
+    if not order_id:
+        return "请提供订单号（通常以 SO 开头）。"
+
+    order = get_order_detail(order_id)
     if not order:
         return f"未找到订单 {order_id}，请核对订单号是否正确（通常以 SO 开头）。"
-    return (
-        f"订单号: {order_id}\n"
-        f"商品: {order['product']}\n"
-        f"金额: ¥{order['amount']:.2f}\n"
-        f"状态: {order['status']}\n"
-        f"物流单号: {order['logistics_no']}"
-    )
+
+    lines = [
+        f"订单号: {order['order_no']}",
+        f"商品: {order['product_name']}（{order['spec'] or '默认规格'}）",
+        f"数量: {order['quantity']}",
+        f"金额: ¥{order['amount']:.2f}",
+        f"订单状态: {order['status']}",
+        f"退款状态: {order['refund_status'] or '无'}",
+        f"下单时间: {order['create_time']}",
+    ]
+    if order.get("receiver_name"):
+        lines.append(f"收货人: {order['receiver_name']} {order.get('receiver_phone') or ''}".strip())
+    if order.get("receiver_addr"):
+        lines.append(f"收货地址: {order['receiver_addr']}")
+
+    if order.get("tracking_no"):
+        lines.append(f"物流单号: {order['tracking_no']}")
+        lines.append(f"承运商: {order.get('carrier') or '未知'}")
+        lines.append(f"物流状态: {order.get('logistics_status') or '暂无'}")
+        if order.get("current_city"):
+            lines.append(f"当前位置: {order['current_city']}")
+    else:
+        lines.append("物流单号: 暂未发货")
+
+    return "\n".join(lines)
 
 
 @tool
 def query_logistics(logistics_no: str) -> str:
     """
-    根据物流单号查询最新物流轨迹。
+    查询物流轨迹。可以传物流单号（如 SF1234567890），也可以直接传订单号（如 SO20261101001），
+    传订单号时会自动通过订单表关联到对应物流单。用户问"到哪了""什么时候送到"时调用。
 
     Args:
-        logistics_no: 物流单号，例如 SF1234567890
+        logistics_no: 物流单号或订单号
     """
-    tracks = _MOCK_LOGISTICS.get(logistics_no)
+    key = (logistics_no or "").strip().upper()
+    if not key:
+        return "请提供物流单号或订单号。"
+
+    if key.startswith("SO"):
+        shipment = get_shipment_by_order(key)
+    else:
+        shipment = get_shipment(key)
+
+    if not shipment:
+        return f"未查询到 {key} 对应的物流信息，请确认物流单号或订单号是否正确。"
+
+    header = [
+        f"物流单号: {shipment['tracking_no']}",
+        f"关联订单: {shipment['order_no']}（{shipment.get('product_name') or '未知商品'}）",
+        f"承运商: {shipment.get('carrier') or '未知'}",
+        f"物流状态: {shipment['status']}",
+    ]
+    if shipment.get("current_city"):
+        header.append(f"当前位置: {shipment['current_city']}")
+
+    tracks = shipment.get("track_detail")
+    if isinstance(tracks, str):
+        try:
+            import json
+            tracks = json.loads(tracks)
+        except (json.JSONDecodeError, TypeError):
+            tracks = []
+
     if not tracks:
-        return f"未查询到物流单号 {logistics_no} 的轨迹，请确认单号是否正确。"
-    return f"物流单号 {logistics_no} 最新轨迹:\n" + "\n".join(tracks)
+        header.append("暂无轨迹明细。")
+        return "\n".join(header)
+
+    header.append(f"最新轨迹（共 {len(tracks)} 条，从新到旧）:")
+    for i, t in enumerate(reversed(tracks), 1):
+        header.append(f"  {i}. {t.get('time', '')}  {t.get('desc', '')}")
+
+    return "\n".join(header)
 
 
 @tool
 def apply_refund(order_id: str, reason: str) -> str:
     """
-    为指定订单提交退款申请。用户明确要求"退货""退款""不想要了"时调用。
+    为指定订单提交退款申请（会真实写入订单表，改变订单状态）。
+    用户明确要求"退货""退款""不想要了""申请售后"时调用。
 
     Args:
-        order_id: 要退款的订单号
+        order_id: 要退款的订单号，例如 SO20261101001
         reason: 退款原因，例如"七天无理由""商品质量问题"
     """
-    order = _MOCK_ORDERS.get(order_id)
-    if not order:
-        return f"退款失败：未找到订单 {order_id}。"
-    if order["status"] == "已完成":
-        return f"订单 {order_id} 已完成，可申请售后退款。原因: {reason}。已提交，预计1-3个工作日审核。"
-    return f"已为订单 {order_id} 提交退款申请（原因: {reason}），仓库拦截后将原路退款。"
+    order_id = (order_id or "").strip().upper()
+    reason = (reason or "未说明原因").strip()
+    if not order_id:
+        return "请提供需要退款的订单号。"
+
+    result = submit_refund(order_id, reason)
+
+    if not result.get("ok"):
+        return f"退款未提交：{result['message']}"
+
+    if result.get("is_aftersale"):
+        return (
+            f"已为订单 {result['order_no']} 提交售后申请。\n"
+            f"商品: {result['product_name']}\n"
+            f"金额: ¥{result['amount']:.2f}\n"
+            f"退款原因: {result['reason']}\n"
+            f"说明: 该订单已完成，已转入售后流程，客服将在 {result['eta']}内联系您确认退回事宜。"
+        )
+
+    return (
+        f"退款申请已提交成功。\n"
+        f"订单号: {result['order_no']}\n"
+        f"商品: {result['product_name']}\n"
+        f"金额: ¥{result['amount']:.2f}\n"
+        f"退款原因: {result['reason']}\n"
+        f"订单状态: {result['status_before']} → {result['status_after']}\n"
+        f"说明: 仓库拦截成功后将原路退款，预计 {result['eta']}到账。"
+    )
 
 
 @tool
 def check_product_stock(product_name: str) -> str:
     """
-    查询某商品的库存、颜色、价格。用户问"有没有货""库存""多少钱"时调用。
+    查询商品库存、价格、规格、所在仓库。用户问"有没有货""还有库存吗""多少钱""什么时候到货"时调用。
+    支持模糊查询，传商品名或 SKU 都可以。
 
     Args:
-        product_name: 商品名称，例如"降噪耳机 Pro"
+        product_name: 商品名称或 SKU，例如"降噪耳机 Pro"、"SKU-DIG-0001-BK"
     """
-    info = _MOCK_STOCK.get(product_name)
-    if not info:
-        return f"未找到商品「{product_name}」，请确认商品名称。"
-    stock_text = f"库存: {info['stock']} 件" + (f"（{info['note']}）" if info.get("note") else "")
-    return f"商品: {product_name}\n规格: {info['color']}\n价格: ¥{info['price']:.2f}\n{stock_text}"
+    keyword = (product_name or "").strip()
+    if not keyword:
+        return "请提供商品名称。"
+
+    items = search_inventory(keyword, limit=3)
+    if not items:
+        return f"未找到商品「{keyword}」，请确认商品名称或 SKU。"
+
+    lines = [f"「{keyword}」共匹配到 {len(items)} 个 SKU："]
+    for i, it in enumerate(items, 1):
+        stock_text = f"库存 {it['stock']} 件"
+        if it["stock"] == 0:
+            stock_text += f"（缺货，预计 {it['restock_eta'] or '待定'} 到货）"
+        elif it["stock"] <= it["safety_stock"]:
+            stock_text += "（库存紧张）"
+        lines.append(
+            f"{i}. {it['sku']}｜{it['product_name']}｜{it['spec']}｜"
+            f"¥{it['price']:.2f}｜{stock_text}｜{it['warehouse']}"
+        )
+
+    lines.append("如需下单请告知具体规格。")
+    return "\n".join(lines)
 
 
 # 工具列表，供 Agent 初始化时传入

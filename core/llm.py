@@ -11,9 +11,13 @@ from config.settings import settings
 
 def _make_ollama(streaming: bool) -> BaseChatModel:
     """
-    构造 ChatOllama。
-    Qwen3 系列默认会输出思考块（thinking），这里按 OLLAMA_THINK 配置尽量关闭：
-    新版 langchain-ollama 用 reasoning=False，老版本不认这个参数就退回普通构造。
+    构造 ChatOllama，并在 OLLAMA_THINK=false 时尽量从源头关闭 Qwen3 的思考输出。
+
+    不同版本的开关位置不同，按优先级依次尝试：
+      1. ChatOllama(reasoning=False)     —— langchain-ollama 新版字段
+      2. ChatOllama(think=False)         —— 部分版本直接透传
+      3. model_kwargs={"think": False}   —— 兜底：Ollama 原生 /api/chat 支持 think 字段
+    都不支持时退回普通构造，由 core/think_filter.py 在输出层兜底过滤，保证界面干净。
     """
     kwargs = dict(
         model=settings.OLLAMA_MODEL,
@@ -24,14 +28,21 @@ def _make_ollama(streaming: bool) -> BaseChatModel:
         num_ctx=settings.OLLAMA_NUM_CTX,
     )
 
-    if not settings.OLLAMA_THINK:
-        try:
-            return ChatOllama(**kwargs, reasoning=False)
-        except TypeError:
-            # 老版本不支持 reasoning 参数，靠 prompt 里的 /no_think 兜底
-            pass
+    if settings.OLLAMA_THINK:
+        return ChatOllama(**kwargs)
 
-    return ChatOllama(**kwargs)
+    fields = getattr(ChatOllama, "model_fields", {}) or {}
+    for name in ("reasoning", "think"):
+        if name in fields:
+            try:
+                return ChatOllama(**kwargs, **{name: False})
+            except Exception:
+                continue
+
+    try:
+        return ChatOllama(**kwargs, model_kwargs={"think": False})
+    except Exception:
+        return ChatOllama(**kwargs)
 
 
 def get_chat_llm(streaming: bool = False) -> BaseChatModel:

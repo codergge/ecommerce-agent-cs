@@ -23,6 +23,8 @@ env/
 # ===== 本地生成的数据（体积大 / 每次运行都会变）=====
 data/chroma_db/
 data/conversations/
+data/ecommerce.db
+data/ecommerce.db-*
 *.sqlite
 *.sqlite3
 

@@ -61,6 +61,14 @@ class Settings:
     )
     MEMORY_WINDOW: int = int(os.getenv("MEMORY_WINDOW", "10"))  # 保留最近 N 轮
 
+    # ---------- 业务模拟数据库（订单 / 物流 / 库存 三表） ----------
+    # 由 db/seed_mock_data.py 生成；文件不存在时首次查询会自动创建
+    BUSINESS_DB_PATH: str = os.getenv(
+        "BUSINESS_DB_PATH",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "data", "ecommerce.db")
+    )
+
     # ---------- 生成参数 ----------
     TEMPERATURE: float = float(os.getenv("TEMPERATURE", "0.3"))
     REQUEST_TIMEOUT: int = int(os.getenv("REQUEST_TIMEOUT", "120"))

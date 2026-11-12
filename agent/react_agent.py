@@ -9,6 +9,7 @@ from langgraph.prebuilt import create_react_agent
 
 from core.llm import get_chat_llm
 from core.prompts import SYSTEM_PROMPT
+from core.think_filter import ThinkStreamFilter, strip_think
 from agent.tools import ALL_TOOLS
 from agent.memory import get_checkpointer
 
@@ -47,20 +48,31 @@ class CustomerServiceAgent:
         return {"configurable": {"thread_id": self.thread_id}}
 
     def chat(self, user_message: str) -> str:
-        """同步对话，返回完整回复。"""
+        """同步对话，返回完整回复（已剔除 Qwen3 思考块）。"""
         result = self.agent.invoke(
             {"messages": [HumanMessage(content=user_message)]},
             config=self.config,
         )
-        return result["messages"][-1].content
+        return strip_think(result["messages"][-1].content)
 
-    def chat_stream(self, user_message: str) -> Generator[str, None, None]:
+    def chat_stream(self, user_message: str, hide_thinking: bool = False) -> Generator[tuple, None, None]:
         """
-        流式对话：逐 token 产出。同时通过 stream_mode="updates" 捕获工具调用事件，
-        便于前端展示"正在查询订单..."这类中间状态。
+        流式对话：逐 token 产出文本，同时通过 stream_mode="updates" 捕获工具调用事件。
+
+        事件类型：
+            ("token", 文本片段)    前端增量渲染
+            ("tool_event", 提示)   前端浮层提示"已调用工具: xxx"
+            ("done", 完整回复)     已剔除思考块的最终文本，用于覆盖渲染与写入历史
+
+        Args:
+            hide_thinking:
+                False（默认）流式过程中照常输出，思考内容也会暂时显示；
+                结束后由前端用 done 事件里的最终文本整块覆盖，页面上只留结果。
+                True 则在流式阶段就用状态机丢弃思考块，全程看不到推理文字。
         """
         inputs = {"messages": [HumanMessage(content=user_message)]}
         final_text = ""
+        think_filter = ThinkStreamFilter()
 
         for mode, chunk in self.agent.stream(inputs, config=self.config, stream_mode=["updates", "messages"]):
             if mode == "messages":
@@ -68,19 +80,32 @@ class CustomerServiceAgent:
                 msg_chunk, _meta = chunk
                 # 只取模型自己产出的文本，过滤 ToolMessage，避免工具原始结果被展示给用户
                 if isinstance(msg_chunk, AIMessageChunk) and msg_chunk.content:
-                    final_text += msg_chunk.content
-                    yield ("token", msg_chunk.content)
+                    content = (
+                        msg_chunk.content
+                        if isinstance(msg_chunk.content, str)
+                        else str(msg_chunk.content)
+                    )
+                    visible = think_filter.feed(content) if hide_thinking else content
+                    if visible:
+                        final_text += visible
+                        yield ("token", visible)
             elif mode == "updates":
-                # 节点更新：可能是 tool 调用或 agent 最终回复
+                # 节点更新：捕获工具调用事件
                 for node_name, node_output in chunk.items():
                     if node_name == "tools":
                         tool_msgs = node_output.get("messages", [])
                         for tm in tool_msgs:
                             tool_name = getattr(tm, "name", None) or "工具"
                             yield ("tool_event", f"🔧 已调用工具: {tool_name}")
-                    # agent 节点的最终消息在 messages stream 里已经逐 token 产出
 
-        yield ("done", final_text)
+        if hide_thinking:
+            tail = think_filter.flush()
+            if tail:
+                final_text += tail
+                yield ("token", tail)
+
+        # 无论是否流式过滤，done 都给出清洗后的最终文本
+        yield ("done", strip_think(final_text))
 
     def get_history(self):
         """获取当前会话的消息历史（从 checkpointer 读）。"""
